@@ -1,0 +1,362 @@
+from django.http import StreamingHttpResponse
+from django.views.decorators.csrf import csrf_exempt
+from django.utils.decorators import method_decorator
+from django.views import View
+import json
+import traceback
+import time
+import threading
+from queue import Queue, Empty
+import logging
+
+from home.agents.farm_orchestrator import FarmOrchestratorAgent
+
+# Global message queue for real-time updates
+message_queues = {}
+queue_lock = threading.Lock()
+
+class RealTimeOrchestratorAgent(FarmOrchestratorAgent):
+    """Enhanced orchestrator with real-time SSE updates"""
+    
+    def __init__(self, session_id=None):
+        super().__init__()
+        self.session_id = session_id
+        
+    def _send_update(self, message, event_type="progress"):
+        """Send real-time update to SSE stream"""
+        if self.session_id and self.session_id in message_queues:
+            try:
+                message_queues[self.session_id].put({
+                    "event": event_type,
+                    "data": message,
+                    "timestamp": time.time()
+                }, block=False)
+            except:
+                pass  # Queue might be full, ignore
+    
+    def classify_intent(self, state):
+        """Override with real-time updates"""
+        self._send_update("🔍 Analyzing your query and determining which agents to activate...", "status")
+        
+        query = state["user_query"]
+        
+        prompt = f"""
+        Classify the following farm-related query into one or more categories:
+        - market: Questions about crop prices, market trends, selling opportunities
+        - satellite: Questions about crop health, field monitoring, vegetation analysis
+        - weather: Questions about weather conditions, forecasts, climate impact
+        - pest: Questions about pest detection, treatment, plant diseases
+        - soil: Questions about soil health, nutrients, pH levels, fertilization
+        - search: Questions requiring general web search, research, latest news, best practices, tutorials, or information not covered by other agents
+        
+        Here is the query: {query}
+        
+        If the query requires multiple agents, list all relevant categories.
+        
+        Examples:
+        - "What's the weather and should I irrigate?" → ["weather", "soil"]
+        - "Crop prices and plant health status" → ["market", "satellite"]
+        - "Rain forecast and pest protection" → ["weather", "pest"]
+        - "Best organic farming practices" → ["search"]
+        - "Latest farming technology trends" → ["search"]
+        - "How to start vertical farming" → ["search"]
+        - "Current agricultural news" → ["search"]
+        - "Weather forecast and latest farming news" → ["weather", "search"]
+        
+        Respond with JSON format:
+        {{
+            "primary_intent": "category_name or multiple",
+            "agents_needed": ["list", "of", "agent", "categories"],
+            "confidence": 0.0-1.0
+        }}
+        
+        Respond ONLY with raw JSON (no code fences, no markdown, no extra text).
+        """
+        
+        self._send_update("🤖 Processing query with AI classification model...", "status")
+        
+        try:
+            response = self.model.generate_content(prompt)
+            result = json.loads(response.text)
+            
+            agents_needed = result.get("agents_needed", [])
+            
+            # Send update about classification results
+            agent_names = {
+                'market': '📈 Market Analysis',
+                'satellite': '🛰️ Satellite Monitoring', 
+                'weather': '🌤️ Weather Forecasting',
+                'pest': '🐛 Pest Management',
+                'soil': '🌱 Soil Analysis',
+                'search': '🔍 Web Search'
+            }
+            
+            active_agents = [agent_names.get(agent, agent) for agent in agents_needed]
+            self._send_update(f"✅ Analysis complete! Activating {len(active_agents)} agents: {', '.join(active_agents)}", "classification")
+            
+            # Determine if single or multiple
+            if len(agents_needed) == 1:
+                state["intent_classification"] = agents_needed[0]
+            else:
+                state["intent_classification"] = "multiple"
+            
+            state["agents_to_run"] = agents_needed
+            state["confidence_score"] = float(result.get("confidence", 0.5))
+            state["agent_responses"] = {}
+            
+            return state
+            
+        except Exception as e:
+            self._send_update(f"⚠️ Classification error, using default agents", "warning")
+            # Fallback classification
+            state["intent_classification"] = "multiple"
+            state["agents_to_run"] = ["weather", "soil"]  # Default fallback
+            state["confidence_score"] = 0.5
+            state["agent_responses"] = {}
+            return state
+    
+    def run_multiple_agents(self, state):
+        """Override with detailed progress updates"""
+        agents_to_run = state.get("agents_to_run", [])
+        agent_responses = {}
+        
+        agent_names = {
+            'market': '📈 Market Analysis',
+            'satellite': '🛰️ Satellite Monitoring', 
+            'weather': '🌤️ Weather Forecasting',
+            'pest': '🐛 Pest Management',
+            'soil': '🌱 Soil Analysis',
+            'search': '🔍 Web Search'
+        }
+        
+        self._send_update(f"🚀 Starting execution of {len(agents_to_run)} specialized agents...", "status")
+        
+        # Map agent names to their corresponding methods
+        agent_map = {
+            "market": self.run_market_agent,
+            "satellite": self.run_satellite_agent,
+            "weather": self.run_weather_agent,
+            "pest": self.run_pest_agent,
+            "soil": self.run_soil_agent,
+            "search": self.run_search_agent
+        }
+        
+        # Execute each required agent with progress updates
+        for i, agent_name in enumerate(agents_to_run, 1):
+            if agent_name in agent_map:
+                agent_display_name = agent_names.get(agent_name, agent_name)
+                self._send_update(f"⚙️ [{i}/{len(agents_to_run)}] Initializing {agent_display_name}...", "agent_start")
+                
+                try:
+                    # Create a temporary state for this agent
+                    temp_state = state.copy()
+                    temp_state = agent_map[agent_name](temp_state)
+                    
+                    # Extract the agent's response
+                    if agent_name in temp_state.get("agent_responses", {}):
+                        agent_responses[agent_name] = temp_state["agent_responses"][agent_name]
+                        self._send_update(f"✅ [{i}/{len(agents_to_run)}] {agent_display_name} completed successfully", "agent_success")
+                        
+                        # Send summary of what the agent found
+                        response = temp_state["agent_responses"][agent_name]
+                        if isinstance(response, dict):
+                            if "recommendations" in response and response["recommendations"]:
+                                rec_count = len(response["recommendations"])
+                                self._send_update(f"📋 {agent_display_name} generated {rec_count} recommendations", "agent_data")
+                            if "error" in response:
+                                self._send_update(f"⚠️ {agent_display_name} encountered an issue: {response['error'][:100]}...", "agent_warning")
+                    else:
+                        self._send_update(f"⚠️ [{i}/{len(agents_to_run)}] {agent_display_name} completed but returned no data", "agent_warning")
+                        
+                except Exception as e:
+                    self._send_update(f"❌ [{i}/{len(agents_to_run)}] {agent_display_name} failed: {str(e)[:100]}...", "agent_error")
+                    agent_responses[agent_name] = {
+                        "error": f"Agent execution failed: {e}",
+                        "data": {},
+                        "recommendations": [f"Unable to get {agent_name} recommendations due to error"]
+                    }
+            else:
+                self._send_update(f"❓ Unknown agent requested: {agent_name}", "warning")
+        
+        # Update state with all collected responses
+        state["agent_responses"] = agent_responses
+        
+        self._send_update(f"🎉 All agents completed! {len(agent_responses)} agents provided data", "agents_complete")
+        return state
+    
+    def run_market_agent(self, state):
+        """Override with progress updates"""
+        self._send_update("📈 Fetching market data and price trends...", "agent_progress")
+        try:
+            from home.agents import MarketAgent
+            agent = MarketAgent()
+            self._send_update("📈 Connecting to market data sources...", "agent_progress")
+            result = agent.process(state["user_query"], state["user_context"])
+            self._send_update("📈 Market analysis complete", "agent_progress")
+            state["agent_responses"]["market"] = result
+        except Exception as e:
+            self._send_update(f"📈 Market agent error: {str(e)[:100]}...", "agent_progress")
+            state["agent_responses"]["market"] = {
+                "error": f"Market agent failed: {e}",
+                "data": {},
+                "recommendations": ["Unable to fetch market data due to error"]
+            }
+        return state
+    
+    def run_satellite_agent(self, state):
+        """Override with progress updates"""
+        self._send_update("🛰️ Accessing satellite imagery and crop monitoring data...", "agent_progress")
+        try:
+            from home.agents import SatelliteAgent
+            agent = SatelliteAgent()
+            self._send_update("🛰️ Processing satellite imagery...", "agent_progress")
+            result = agent.process(state["user_query"], state["user_context"])
+            self._send_update("🛰️ Satellite analysis complete", "agent_progress")
+            state["agent_responses"]["satellite"] = result
+        except Exception as e:
+            self._send_update(f"🛰️ Satellite agent error: {str(e)[:100]}...", "agent_progress")
+            state["agent_responses"]["satellite"] = {
+                "error": f"Satellite agent failed: {e}",
+                "data": {},
+                "recommendations": ["Unable to fetch satellite data due to error"]
+            }
+        return state
+    
+    def run_weather_agent(self, state):
+        """Override with progress updates"""
+        self._send_update("🌤️ Fetching weather forecasts and climate data...", "agent_progress")
+        try:
+            from home.agents import WeatherAgent
+            agent = WeatherAgent()
+            self._send_update("🌤️ Analyzing weather patterns...", "agent_progress")
+            result = agent.process(state["user_query"], state["user_context"])
+            self._send_update("🌤️ Weather analysis complete", "agent_progress")
+            state["agent_responses"]["weather"] = result
+        except Exception as e:
+            self._send_update(f"🌤️ Weather agent error: {str(e)[:100]}...", "agent_progress")
+            state["agent_responses"]["weather"] = {
+                "error": f"Weather agent failed: {e}",
+                "data": {},
+                "recommendations": ["Unable to fetch weather data due to error"]
+            }
+        return state
+    
+    def run_pest_agent(self, state):
+        """Override with progress updates"""
+        self._send_update("🐛 Analyzing pest threats and disease patterns...", "agent_progress")
+        try:
+            from home.agents import PestAgent
+            agent = PestAgent()
+            self._send_update("🐛 Checking pest databases...", "agent_progress")
+            result = agent.process(state["user_query"], state["user_context"])
+            self._send_update("🐛 Pest analysis complete", "agent_progress")
+            state["agent_responses"]["pest"] = result
+        except Exception as e:
+            self._send_update(f"🐛 Pest agent error: {str(e)[:100]}...", "agent_progress")
+            state["agent_responses"]["pest"] = {
+                "error": f"Pest agent failed: {e}",
+                "data": {},
+                "recommendations": ["Unable to fetch pest data due to error"]
+            }
+        return state
+    
+    def run_soil_agent(self, state):
+        """Override with progress updates"""
+        self._send_update("🌱 Analyzing soil health and nutrient data...", "agent_progress")
+        try:
+            from home.agents import SoilAgent
+            agent = SoilAgent()
+            self._send_update("🌱 Processing soil composition data...", "agent_progress")
+            result = agent.process(state["user_query"], state["user_context"])
+            self._send_update("🌱 Soil analysis complete", "agent_progress")
+            state["agent_responses"]["soil"] = result
+        except Exception as e:
+            self._send_update(f"🌱 Soil agent error: {str(e)[:100]}...", "agent_progress")
+            state["agent_responses"]["soil"] = {
+                "error": f"Soil agent failed: {e}",
+                "data": {},
+                "recommendations": ["Unable to fetch soil data due to error"]
+            }
+        return state
+    
+    def run_search_agent(self, state):
+        """Override with progress updates"""
+        self._send_update("🔍 Searching web for latest farming information...", "agent_progress")
+        try:
+            from home.agents import SearchAgent
+            agent = SearchAgent()
+            self._send_update("🔍 Querying multiple data sources...", "agent_progress")
+            result = agent.process(state["user_query"], state["user_context"])
+            self._send_update("🔍 Web search complete", "agent_progress")
+            state["agent_responses"]["search"] = result
+        except Exception as e:
+            self._send_update(f"🔍 Search agent error: {str(e)[:100]}...", "agent_progress")
+            state["agent_responses"]["search"] = {
+                "error": f"Search agent failed: {e}",
+                "data": {
+                    "original_query": state["user_query"],
+                    "optimized_query": "",
+                    "search_results": [],
+                    "result_count": 0,
+                    "search_answer": "",
+                    "sources": []
+                },
+                "recommendations": ["Unable to perform web search due to error"]
+            }
+        return state
+    
+    def make_decision(self, state):
+        """Override with progress updates"""
+        self._send_update("🧠 Synthesizing all agent responses into final recommendation...", "status")
+        
+        query = state["user_query"]
+        responses = state["agent_responses"]
+        
+        if not responses:
+            state["final_response"] = "I apologize, but I couldn't gather the necessary information to answer your question. Please try again or rephrase your query."
+            return state
+        
+        self._send_update("🧠 Analyzing collected data and generating insights...", "status")
+        
+        prompt = f"""
+        Agent Responses:
+            {json.dumps(responses, indent=2)}
+
+        Now, based on the responses from all agents above, write a clear and friendly reply that directly addresses the user's original question.
+
+        Focus on being conversational, helpful, and easy to understand. Offer practical advice, specific recommendations, and next steps where possible.
+
+        If any agent ran into an error or couldn't fetch something, mention that briefly but continue with whatever useful information is available.
+
+        Structure your response like you're explaining it to a real person — keep it informative but natural and approachable.
+        """
+
+        try:
+            self._send_update("🧠 Generating personalized response...", "status")
+            response = self.model.generate_content(prompt)
+            state["final_response"] = response.text
+            self._send_update("✅ Final response generated successfully", "status")
+            
+        except Exception as e:
+            error_response = "I encountered an error processing your request. Please try again."
+            state["final_response"] = error_response
+            self._send_update(f"❌ Error generating response: {str(e)[:100]}...", "error")
+        
+        return state
+
+
+def keep_alive_sender(session_id, stop_event):
+    """Send periodic keep-alive messages"""
+    while not stop_event.is_set():
+        try:
+            if session_id in message_queues:
+                message_queues[session_id].put({
+                    "event": "keepalive",
+                    "data": "ping",
+                    "timestamp": time.time()
+                }, timeout=1)
+        except:
+            pass  # Queue might be full or session ended
+        
+        # Wait 15 seconds or until stop event
+        stop_event.wait(15)

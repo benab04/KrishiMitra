@@ -1,0 +1,29 @@
+# Django and web framework
+Django
+djangorestframework
+django-cors-headers
+
+# AI and ML libraries
+google-generativeai
+langgraph
+langchain
+langchain-core
+# Database
+psycopg2-binary  # For PostgreSQL (optional)
+
+# API and HTTP requests
+requests
+httpx
+
+# Environment and configuration
+python-dotenv
+
+# Data processing
+pandas
+numpy
+
+# Vector embeddings (for Pinecone-like functionality)
+sentence-transformers
+faiss-cpu  # For local vector similarity search
+
+# Web searching (Tavily alternative
