@@ -1,4 +1,4 @@
-# KrishiMitra 🌾
+# KrishiMitra 
 
 KrishiMitra is a comprehensive agricultural management system that leverages multiple AI agents to provide farmers with intelligent insights and support for their farming operations.
 
